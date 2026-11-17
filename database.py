@@ -19,44 +19,32 @@ CATEGORIES = {
 }
 
 
-def connect():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row            # lets us write row["amount"]
-    conn.execute("PRAGMA foreign_keys = ON")  # make SQLite check the foreign key
-    return conn
-
-
 def run(sql, params=()):
-    """Runs one statement, saves the change and returns the rows (if any)."""
-    with connect() as conn:                   # "with" commits automatically
+    """Runs one SQL statement, saves the change and returns the rows (if any)."""
+    with sqlite3.connect(DB_FILE) as conn:        # "with" commits automatically
+        conn.row_factory = sqlite3.Row            # lets us write row["amount"]
+        conn.execute("PRAGMA foreign_keys = ON")  # make SQLite check the foreign key
         return conn.execute(sql, params).fetchall()
 
 
 def init_db():
     """Creates the two tables on first run and fills in the categories."""
-    with connect() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS categories (
-                category_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT NOT NULL,
-                type        TEXT NOT NULL CHECK (type IN ('Income', 'Expense')),
-                UNIQUE (name, type)
-            );
-            CREATE TABLE IF NOT EXISTS transactions (
-                txn_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                txn_date     TEXT    NOT NULL,                 -- YYYY-MM-DD
-                type         TEXT    NOT NULL CHECK (type IN ('Income', 'Expense')),
-                amount       REAL    NOT NULL CHECK (amount > 0),
-                category_id  INTEGER NOT NULL REFERENCES categories (category_id),
-                description  TEXT,
-                payment_mode TEXT,
-                is_essential INTEGER NOT NULL DEFAULT 0        -- 1 = need, 0 = want
-            );
-        """)
-        for txn_type, names in CATEGORIES.items():
-            for name in names:
-                conn.execute("INSERT OR IGNORE INTO categories (name, type) VALUES (?, ?)",
-                             (name, txn_type))
+    run("""CREATE TABLE IF NOT EXISTS categories (
+               category_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name        TEXT NOT NULL,
+               type        TEXT NOT NULL CHECK (type IN ('Income', 'Expense')),
+               UNIQUE (name, type))""")
+    run("""CREATE TABLE IF NOT EXISTS transactions (
+               txn_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+               txn_date    TEXT    NOT NULL,                  -- YYYY-MM-DD
+               type        TEXT    NOT NULL CHECK (type IN ('Income', 'Expense')),
+               amount      REAL    NOT NULL CHECK (amount > 0),
+               category_id INTEGER NOT NULL REFERENCES categories (category_id),
+               description TEXT,
+               is_need     INTEGER NOT NULL DEFAULT 0)        -- 1 = need, 0 = want""")
+    for txn_type, names in CATEGORIES.items():
+        for name in names:
+            run("INSERT OR IGNORE INTO categories (name, type) VALUES (?, ?)", (name, txn_type))
 
 
 def category_id(name, txn_type):
@@ -64,22 +52,19 @@ def category_id(name, txn_type):
     return rows[0]["category_id"]
 
 
-# ----------------------------------------------------- Add, Update, Delete
+# ------------------------------------------------------ Add, Update, Delete
 
-def add_transaction(txn_date, txn_type, amount, category, description, mode, essential):
-    run("""INSERT INTO transactions
-               (txn_date, type, amount, category_id, description, payment_mode, is_essential)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (txn_date, txn_type, amount, category_id(category, txn_type), description, mode, essential))
+def add_transaction(txn_date, txn_type, amount, category, description, is_need):
+    run("""INSERT INTO transactions (txn_date, type, amount, category_id, description, is_need)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (txn_date, txn_type, amount, category_id(category, txn_type), description, is_need))
 
 
-def update_transaction(txn_id, txn_date, txn_type, amount, category, description, mode, essential):
+def update_transaction(txn_id, txn_date, txn_type, amount, category, description, is_need):
     run("""UPDATE transactions
-              SET txn_date = ?, type = ?, amount = ?, category_id = ?,
-                  description = ?, payment_mode = ?, is_essential = ?
+              SET txn_date = ?, type = ?, amount = ?, category_id = ?, description = ?, is_need = ?
             WHERE txn_id = ?""",
-        (txn_date, txn_type, amount, category_id(category, txn_type), description, mode,
-         essential, txn_id))
+        (txn_date, txn_type, amount, category_id(category, txn_type), description, is_need, txn_id))
 
 
 def delete_transaction(txn_id):
@@ -88,57 +73,40 @@ def delete_transaction(txn_id):
 
 # ------------------------------------------------------- Search and Display
 
-def period_filter(start, end):
-    """WHERE conditions for the selected period. None means 'no limit'."""
-    where, params = ["1 = 1"], []
-    if start:
-        where.append("t.txn_date >= ?")
-        params.append(start)
-    if end:
-        where.append("t.txn_date <= ?")
-        params.append(end)
-    return where, params
-
-
-def get_transactions(start=None, end=None, search="", txn_type="All"):
-    where, params = period_filter(start, end)
-    if txn_type != "All":
-        where.append("t.type = ?")
-        params.append(txn_type)
-    if search:
-        where.append("(t.description LIKE ? OR c.name LIKE ? OR t.payment_mode LIKE ?)")
-        params += ["%" + search + "%"] * 3
+def get_transactions(start, end, search=""):
+    """All transactions of the period, newest first. 'search' can be empty."""
+    like = "%" + search + "%"
     return run("""SELECT t.*, c.name AS category
                     FROM transactions t JOIN categories c ON c.category_id = t.category_id
-                   WHERE """ + " AND ".join(where) + """
-                   ORDER BY t.txn_date DESC, t.txn_id DESC""", params)
+                   WHERE t.txn_date BETWEEN ? AND ?
+                     AND (t.description LIKE ? OR c.name LIKE ? OR t.type LIKE ?)
+                   ORDER BY t.txn_date DESC, t.txn_id DESC""", (start, end, like, like, like))
 
 
 # ------------------------------------------------------------------ Reports
+# TOTAL() is SQLite's SUM() that gives 0 instead of NULL when there are no rows.
 
-def get_totals(start=None, end=None):
-    """Total income and total expenses for the period."""
-    where, params = period_filter(start, end)
-    row = run("""SELECT COALESCE(SUM(CASE WHEN t.type = 'Income'  THEN t.amount END), 0) AS income,
-                        COALESCE(SUM(CASE WHEN t.type = 'Expense' THEN t.amount END), 0) AS expense
-                   FROM transactions t WHERE """ + " AND ".join(where), params)[0]
-    return row["income"], row["expense"]
+def get_totals(start, end):
+    """Returns (total income, total expenses, expenses marked as needs)."""
+    row = run("""SELECT TOTAL(CASE WHEN type = 'Income'  THEN amount END) AS income,
+                        TOTAL(CASE WHEN type = 'Expense' THEN amount END) AS expense,
+                        TOTAL(CASE WHEN type = 'Expense' AND is_need = 1 THEN amount END) AS needs
+                   FROM transactions WHERE txn_date BETWEEN ? AND ?""", (start, end))[0]
+    return row["income"], row["expense"], row["needs"]
 
 
-def get_monthly_summary(start=None, end=None):
+def get_monthly_summary(start, end):
     """One row per month: income and expenses."""
-    where, params = period_filter(start, end)
-    return run("""SELECT strftime('%Y-%m', t.txn_date) AS month,
-                         COALESCE(SUM(CASE WHEN t.type = 'Income'  THEN t.amount END), 0) AS income,
-                         COALESCE(SUM(CASE WHEN t.type = 'Expense' THEN t.amount END), 0) AS expense
-                    FROM transactions t WHERE """ + " AND ".join(where) + """
-                   GROUP BY month ORDER BY month""", params)
+    return run("""SELECT strftime('%Y-%m', txn_date) AS month,
+                         TOTAL(CASE WHEN type = 'Income'  THEN amount END) AS income,
+                         TOTAL(CASE WHEN type = 'Expense' THEN amount END) AS expense
+                    FROM transactions WHERE txn_date BETWEEN ? AND ?
+                   GROUP BY month ORDER BY month""", (start, end))
 
 
-def get_category_report(start=None, end=None):
+def get_category_report(start, end):
     """Expenses added up category by category, biggest first."""
-    where, params = period_filter(start, end)
-    return run("""SELECT c.name AS category, SUM(t.amount) AS total, COUNT(*) AS count
+    return run("""SELECT c.name AS category, SUM(t.amount) AS total
                     FROM transactions t JOIN categories c ON c.category_id = t.category_id
-                   WHERE t.type = 'Expense' AND """ + " AND ".join(where) + """
-                   GROUP BY c.name ORDER BY total DESC""", params)
+                   WHERE t.type = 'Expense' AND t.txn_date BETWEEN ? AND ?
+                   GROUP BY c.name ORDER BY total DESC""", (start, end))
